@@ -7,6 +7,7 @@ import com.netflix.astyanax.CassandraOperationType;
 import com.netflix.astyanax.Keyspace;
 import com.netflix.astyanax.Cluster;
 import com.netflix.astyanax.KeyspaceTracerFactory;
+import com.netflix.astyanax.connectionpool.ConnectionContext;
 import com.netflix.astyanax.connectionpool.ConnectionPool;
 import com.netflix.astyanax.connectionpool.ConnectionPoolConfiguration;
 import com.netflix.astyanax.connectionpool.Host;
@@ -279,7 +280,7 @@ public class ThriftProxy implements Cassandra.Iface
                     new AbstractCqlOperationImpl<CqlResult>(tracerFactory.newTracer(CassandraOperationType.CQL),
                                                             client.getKeyspaceName(), q) {
                         @Override
-                        public CqlResult internalExecute(Cassandra.Client thriftClient) throws Exception {
+                        public CqlResult internalExecute(Cassandra.Client thriftClient, ConnectionContext context) throws Exception {
                             return thriftClient.execute_cql_query(q, c);
                         }
                     }, asConfig.getRetryPolicy());
