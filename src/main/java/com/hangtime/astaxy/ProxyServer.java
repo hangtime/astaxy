@@ -24,7 +24,6 @@ import java.util.Set;
 
 import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
-import org.apache.cassandra.config.Config;
 import org.apache.cassandra.thrift.Cassandra;
 import org.apache.cassandra.thrift.CustomTHsHaServer;
 import org.apache.cassandra.thrift.TCustomNonblockingServerSocket;
@@ -39,6 +38,10 @@ import org.apache.thrift.transport.TTransportFactory;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.timgroup.statsd.StatsDClient;
+import com.timgroup.statsd.NonBlockingStatsDClient;
+import com.timgroup.statsd.NoOpStatsDClient;
 
 import org.yaml.snakeyaml.Loader;
 import org.yaml.snakeyaml.TypeDescription;
@@ -69,8 +72,8 @@ public class ProxyServer
         Yaml yaml = new Yaml(new Loader(new Constructor(Config.class)));
         Config conf = (Config)yaml.load(input);
 
-        String keyspaceName = args[0];
-        String localDatacenter = (args.length >= 2 ? args[1] : null);
+        String keyspaceName = conf.keyspace_name;
+        String localDatacenter = conf.datacenter_name;
 
         logger.info("Proxing for keyspace " + keyspaceName + " in local DC " +
                     (localDatacenter != null ? localDatacenter : "null"));
@@ -100,7 +103,16 @@ public class ProxyServer
         AstyanaxContext<Keyspace> context = builder.buildKeyspace(ThriftFamilyFactory.getInstance());
         context.start();
 
-        Cassandra.Iface handler = new ThriftProxy(context);
+        StatsDClient statsd = new NoOpStatsDClient();
+        try {
+            statsd = new NonBlockingStatsDClient("astaxy", conf.statsd_host, conf.statsd_port);
+            logger.info("Sending statsd to " + conf.statsd_host + ":" + conf.statsd_port);
+        } catch (Exception e) {
+            logger.error("Unable to find statsd host.", e);
+        }
+
+
+        Cassandra.Iface handler = new ThriftProxy(context, statsd, conf.airbrake_key);
 
         try {
             InetAddress address = InetAddress.getByName("0.0.0.0");

@@ -1,5 +1,19 @@
 package com.hangtime.astaxy;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
+import java.lang.StackTraceElement;
+import java.lang.Thread;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import airbrake.AirbrakeNoticeBuilder;
+import airbrake.AirbrakeNotifier;
+
 import com.netflix.astyanax.AstyanaxConfiguration;
 import com.netflix.astyanax.AstyanaxContext;
 import com.netflix.astyanax.CassandraOperationTracer;
@@ -19,14 +33,7 @@ import com.netflix.astyanax.shallows.EmptyKeyspaceTracerFactory;
 import com.netflix.astyanax.thrift.AbstractKeyspaceOperationImpl;
 import com.netflix.astyanax.thrift.ddl.ThriftKeyspaceDefinitionImpl;
 
-import java.nio.ByteBuffer;
-import java.nio.charset.Charset;
-import java.util.Date;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import com.timgroup.statsd.StatsDClient;
 
 import org.apache.cassandra.thrift.*;
 import org.apache.thrift.TException;
@@ -48,14 +55,20 @@ public class ThriftProxy implements Cassandra.Iface
     private final ConnectionPoolConfiguration cpConfig;
     private final KeyspaceTracerFactory tracerFactory;
 
+    private final StatsDClient statsd;
+    private final String airbrakeKey;
+
     @SuppressWarnings("unchecked")
-    public ThriftProxy(AstyanaxContext<Keyspace> context) {
+    public ThriftProxy(AstyanaxContext<Keyspace> context, StatsDClient statsd, String airbrakeKey) {
         this.asConfig = context.getAstyanaxConfiguration();
         this.client = context.getEntity();
         this.connectionPool = (ConnectionPool<Cassandra.Client>)context.getConnectionPool();
         this.context = context;
         this.cpConfig = context.getConnectionPoolConfiguration();
         this.tracerFactory = EmptyKeyspaceTracerFactory.getInstance();
+
+        this.statsd = statsd;
+        this.airbrakeKey = airbrakeKey;
     }
 
     public void login(AuthenticationRequest auth_request)
@@ -68,6 +81,7 @@ public class ThriftProxy implements Cassandra.Iface
     throws InvalidRequestException, TException
     {
         log_result("set_keyspace", keyspace);
+        statsd.count("set_keyspace." + keyspace, 1);
         if (!this.context.getKeyspaceName().equals(keyspace)) {
             throw new InvalidRequestException("Cannot operate on keyspace " + keyspace);
         }
@@ -218,9 +232,11 @@ public class ThriftProxy implements Cassandra.Iface
         {
             KsDef result = ((ThriftKeyspaceDefinitionImpl)client.describeKeyspace()).getThriftKeyspaceDefinition();
             log_result("describe_keyspace", keyspace, start);
+            statsd.count("describe_keyspace." + keyspace, 1);
             return result;
         }
-        catch (ConnectionException e) {
+        catch (Exception e) {
+            notify_airbrake(e);
             throw new TException("Connection error", e);
         }
     }
@@ -276,30 +292,31 @@ public class ThriftProxy implements Cassandra.Iface
         final Compression c = compression;
 
         try {
-            OperationResult<CqlResult> result = connectionPool.executeWithFailover(
-                    new AbstractCqlOperationImpl<CqlResult>(tracerFactory.newTracer(CassandraOperationType.CQL),
-                                                            client.getKeyspaceName(), q) {
-                        @Override
-                        public CqlResult internalExecute(Cassandra.Client thriftClient, ConnectionContext context) throws Exception {
-                            return thriftClient.execute_cql_query(q, c);
-                        }
-                    }, asConfig.getRetryPolicy());
+            AbstractCqlOperationImpl<CqlResult> op = new AbstractCqlOperationImpl<CqlResult>(
+                tracerFactory.newTracer(CassandraOperationType.CQL),
+                client.getKeyspaceName(), q) {
+                    @Override
+                    public CqlResult internalExecute(Cassandra.Client thriftClient, ConnectionContext context) throws Exception {
+                        return thriftClient.execute_cql_query(q, c);
+                    }
+                };
+            OperationResult<CqlResult> result = connectionPool.executeWithFailover(op, asConfig.getRetryPolicy());
 
-            log_result("execute_cql_query", query, result, start);
+            log_result("cql." + op.method, query, result, start);
+            statsd.count("cql." + op.method, 1);
+
             return result.getResult();
         }
-        catch (OperationException e) {
-            log_result("exception_cql_query", query);
-            throw new TException(e);
-        }
-        catch (ConnectionException e) {
-            log_result("exception_cql_query", query);
+        catch (Exception e) {
+            notify_airbrake(e);
+            log_result("cql_exception", query);
             throw new TException(e);
         }
     }
 
     private abstract static class AbstractCqlOperationImpl<R> extends AbstractKeyspaceOperationImpl<R> {
-        private ByteBuffer key = null;
+        public ByteBuffer key = null;
+        public String method = "U";
         private static Pattern re = Pattern.compile("key[ ']*(?:in *|=)[ (']*([^,)']*)", Pattern.CASE_INSENSITIVE);
 
         public AbstractCqlOperationImpl(CassandraOperationTracer tracer, Host pinnedHost, String keyspaceName, ByteBuffer q) {
@@ -310,6 +327,8 @@ public class ThriftProxy implements Cassandra.Iface
             if (m.find() && m.groupCount() > 0) {
                 this.key = ByteBuffer.wrap(m.group(1).getBytes(charset));
             }
+
+            this.method = cql.substring(0, 1);
         }
 
         public AbstractCqlOperationImpl(CassandraOperationTracer tracer, String keyspaceName, ByteBuffer cql) {
@@ -341,13 +360,26 @@ public class ThriftProxy implements Cassandra.Iface
         throw new TException("Method is not implemented: set_cql_version");
     }
 
+    protected void notify_airbrake(Throwable t) {
+        if (airbrakeKey == null || "".equals(airbrakeKey))
+            return;
+
+        AirbrakeNotifier notifier = new AirbrakeNotifier();
+        notifier.notify(new AirbrakeNoticeBuilder(airbrakeKey, t, "prod").newNotice());
+    }
+
     protected void log_result(String method, String msg, OperationResult<?> result, long start) {
         long queryLatency = result != null ? result.getLatency(TimeUnit.MICROSECONDS) : -1;
-        int getAttemptsCount = result != null ? result.getAttemptsCount() : -1;
+        int attemptsCount = result != null ? result.getAttemptsCount() : -1;
         long fullLatency = start != 0 ? (System.nanoTime() - start)/1000 : -1;
         String host = "-";
         if (result != null) host = result.getHost().toString();
-        logger.info(host + "\t" + queryLatency + "\t" + fullLatency + " \t" + getAttemptsCount + "\t" + method + ": " + msg.substring(0, Math.min(msg.length(), 64)));
+
+        logger.info(host + "\t" + queryLatency + "\t" + fullLatency + " \t" + attemptsCount + "\t" +
+                    method + ": " + msg.substring(0, Math.min(msg.length(), 96)));
+
+        statsd.time(method + ".query", (int)queryLatency);
+        statsd.time(method + ".proxy", (int)fullLatency - (int)queryLatency);
     }
 
     protected void log_result(String method, String msg) {
