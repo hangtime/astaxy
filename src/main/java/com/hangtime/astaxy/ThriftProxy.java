@@ -376,7 +376,7 @@ public class ThriftProxy implements Cassandra.Iface
         if (result != null) host = result.getHost().toString();
 
         logger.info(host + "\t" + queryLatency + "\t" + fullLatency + " \t" + attemptsCount + "\t" +
-                    method + ": " + msg.substring(0, Math.min(msg.length(), 96)));
+                    method + ": " + msg.substring(0, Math.min(msg.length(), 256)));
 
         statsd.time(method + ".query", (int)queryLatency);
         statsd.time(method + ".proxy", (int)fullLatency - (int)queryLatency);
